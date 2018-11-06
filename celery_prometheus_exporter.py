@@ -32,6 +32,9 @@ WORKERS = prometheus_client.Gauge(
     'celery_workers', 'Number of alive workers')
 LATENCY = prometheus_client.Histogram(
     'celery_task_latency', 'Seconds between a task is received and started.')
+RUNTIME = prometheus_client.Histogram(
+    'celery_task_runtime', 'Seconds of the task in execution, from started to ready state(success/failure/revoke).',
+    ['state', 'name'])
 
 
 class MonitorThread(threading.Thread):
@@ -69,7 +72,18 @@ class MonitorThread(threading.Thread):
                     state = task.state
                 if state == celery.states.STARTED:
                     self._observe_latency(evt)
+                if state in celery.states.READY_STATES:
+                    self._observe_runtime(evt, state)
                 self._collect_tasks(evt, state)
+
+    def _observe_runtime(self, evt, state):
+        try:
+            prev_evt = self._state.tasks[evt['uuid']]
+        except KeyError:  # pragma: no cover
+            pass
+        else:
+            RUNTIME.labels(state=state, name=prev_evt.name).observe(
+                evt['local_received'] - prev_evt.local_received)
 
     def _observe_latency(self, evt):
         try:

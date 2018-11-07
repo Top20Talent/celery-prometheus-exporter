@@ -56,23 +56,24 @@ class MonitorThread(threading.Thread):
         self._state = self._app.events.State(max_tasks_in_memory=max_tasks_in_memory)
         self._known_states = set()
         self._known_states_names = set()
-        self._tasks_started = dict()
+        self._queue_mapping = dict()
         super(MonitorThread, self).__init__(*args, **kwargs)
 
     def run(self):  # pragma: no cover
         self._monitor()
 
-    @staticmethod
-    def _handle_tasks_sent(event, state=None):
+    def _handle_tasks_sent(self, event, state=None):
         try:
-            queue, name = event['queue'], event['name']
+            task_name = event['name']
+            task_queue = event.get('queue') or self._queue_mapping.get(task_name)
         except KeyError:
             pass
         else:
             if state:
-                TASKS_QUEUE_LENGTH.labels(queue=queue, name=name).dec()
+                TASKS_QUEUE_LENGTH.labels(queue=task_queue, name=task_name).dec()
             else:
-                TASKS_QUEUE_LENGTH.labels(queue=queue, name=name).inc()
+                self._queue_mapping.update({task_name: task_queue})
+                TASKS_QUEUE_LENGTH.labels(queue=task_queue, name=task_name).inc()
 
     def _process_event(self, evt):
         # Events might come in in parallel. Celery already has a lock
@@ -89,7 +90,7 @@ class MonitorThread(threading.Thread):
                     task.event(evt_state)
                     state = task.state
                 if state == celery.states.STARTED:
-                    self._observe_latency(evt)
+                    self._observe_latency(evt, state)
                 if state == celery.states.SUCCESS:
                     self._observe_runtime(evt)
                 self._collect_tasks(evt, state)
@@ -102,7 +103,7 @@ class MonitorThread(threading.Thread):
         else:
             TASKS_RUNTIME.labels(name=prev_evt.name).observe(evt['runtime'])
 
-    def _observe_latency(self, evt):
+    def _observe_latency(self, evt, state):
         try:
             prev_evt = self._state.tasks[evt['uuid']]
         except KeyError:  # pragma: no cover
@@ -110,7 +111,7 @@ class MonitorThread(threading.Thread):
         else:
             # ignore latency if it is a retry
             if prev_evt.state == celery.states.RECEIVED:
-                LATENCY.observe(
+                LATENCY.labels(state=state, name=prev_evt.name).observe(
                     evt['timestamp'] - prev_evt.timestamp)
 
     def _collect_tasks(self, evt, state):

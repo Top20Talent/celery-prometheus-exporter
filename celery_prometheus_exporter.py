@@ -32,7 +32,6 @@ WORKERS = prometheus_client.Gauge(
     'celery_workers', 'Number of alive workers')
 LATENCY = prometheus_client.Histogram(
     'celery_task_latency', 'Seconds between a task is received and started.',
-    ['state', 'name'],
     buckets=(0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0))
 TASKS_RUNTIME = prometheus_client.Histogram(
     'celery_tasks_runtime_seconds', 'Task runtime (seconds)',
@@ -56,7 +55,8 @@ class MonitorThread(threading.Thread):
         self._state = self._app.events.State(max_tasks_in_memory=max_tasks_in_memory)
         self._known_states = set()
         self._known_states_names = set()
-        self._queue_mapping = dict()
+        self._task_queues = dict()
+        self._task_counts_in_queue = dict()
         super(MonitorThread, self).__init__(*args, **kwargs)
 
     def run(self):  # pragma: no cover
@@ -65,15 +65,19 @@ class MonitorThread(threading.Thread):
     def _handle_tasks_sent(self, event, state=None):
         try:
             task_name = event['name']
-            task_queue = event.get('queue') or self._queue_mapping.get(task_name)
+            task_queue = event.get('queue') or self._task_queues.get(task_name)
+            if not task_queue:
+                return
+
+            self._task_queues.update({task_name: task_queue})
+            self._task_counts_in_queue.setdefault(task_name, 0)
         except KeyError:
             pass
         else:
-            if state:
-                TASKS_QUEUE_LENGTH.labels(queue=task_queue, name=task_name).dec()
-            else:
-                self._queue_mapping.update({task_name: task_queue})
-                TASKS_QUEUE_LENGTH.labels(queue=task_queue, name=task_name).inc()
+            self._task_counts_in_queue[task_name] += 1 if not state else -1
+            cnt = collections.Counter(self._task_counts_in_queue)
+            for t in set(cnt.elements()):
+                TASKS_QUEUE_LENGTH.labels(queue=task_queue, name=task_name).set(cnt[t])
 
     def _process_event(self, evt):
         # Events might come in in parallel. Celery already has a lock
@@ -90,7 +94,7 @@ class MonitorThread(threading.Thread):
                     task.event(evt_state)
                     state = task.state
                 if state == celery.states.STARTED:
-                    self._observe_latency(evt, state)
+                    self._observe_latency(evt)
                 if state == celery.states.SUCCESS:
                     self._observe_runtime(evt)
                 self._collect_tasks(evt, state)
@@ -103,7 +107,7 @@ class MonitorThread(threading.Thread):
         else:
             TASKS_RUNTIME.labels(name=prev_evt.name).observe(evt['runtime'])
 
-    def _observe_latency(self, evt, state):
+    def _observe_latency(self, evt):
         try:
             prev_evt = self._state.tasks[evt['uuid']]
         except KeyError:  # pragma: no cover
@@ -111,7 +115,7 @@ class MonitorThread(threading.Thread):
         else:
             # ignore latency if it is a retry
             if prev_evt.state == celery.states.RECEIVED:
-                LATENCY.labels(state=state, name=prev_evt.name).observe(
+                LATENCY.labels.observe(
                     evt['timestamp'] - prev_evt.timestamp)
 
     def _collect_tasks(self, evt, state):

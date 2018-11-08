@@ -201,7 +201,7 @@ class EnableEventsThread(threading.Thread):
 class BrokerQueueMonitorThread(threading.Thread):
     KEY_PREFIX = '_kombu.binding.'
     BUILTIN_QUEUES = ['celery.pidbox', 'reply.celery.pidbox', 'celeryev']
-    INTERVAL_SECONDS = os.environ.get('QUEUE_INTERVAL_SECONDS', 10)
+    INTERVAL_SECONDS = os.environ.get('QUEUE_INTERVAL_SECONDS', 5)
 
     def __init__(self, redis_client, *args, **kwargs):
         self.redis_client = redis_client
@@ -219,10 +219,11 @@ class BrokerQueueMonitorThread(threading.Thread):
 
     def collect_metrics(self):
         queues = self._get_all_queues()
-        task_queues = self._get_task_queues(queues)
+        for queue in queues:
+            self._collect_queue_lengths(queue)
 
-        map(self._collect_queue_lengths, queues)
-        map(self._collect_queue_tasks, task_queues)
+        for queue in self._get_task_queues(queues):
+            self._collect_queue_tasks(queue)
 
     def _get_task_queues(self, queues):
         return [q for q in queues if q not in self.BUILTIN_QUEUES]
@@ -352,19 +353,15 @@ def main():  # pragma: no cover
 
     setup_metrics(app)
 
-    t = MonitorThread(app=app, max_tasks_in_memory=opts.max_tasks_in_memory)
-    t.daemon = True
+    t = MonitorThread(app=app, max_tasks_in_memory=opts.max_tasks_in_memory, daemon=True)
     t.start()
-    w = WorkerMonitoringThread(app=app)
-    w.daemon = True
+    w = WorkerMonitoringThread(app=app, daemon=True)
     w.start()
-    q = BrokerQueueMonitorThread(redis_client=redis_client)
-    q.daemon = True
+    q = BrokerQueueMonitorThread(redis_client=redis_client, daemon=True)
     q.start()
     e = None
     if opts.enable_events:
-        e = EnableEventsThread(app=app)
-        e.daemon = True
+        e = EnableEventsThread(app=app, daemon=True)
         e.start()
     start_httpd(opts.addr)
     t.join()

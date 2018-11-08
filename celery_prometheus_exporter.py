@@ -1,18 +1,22 @@
 from __future__ import print_function
+import os
+import sys
+import json
+import time
+import collections
 import argparse
+import logging
+import signal
+import threading
+
+from itertools import chain
+from json import JSONDecodeError
+
+import redis
 import celery
 import celery.states
 import celery.events
-import collections
-from itertools import chain
-import logging
 import prometheus_client
-import signal
-import sys
-import threading
-import time
-import json
-import os
 
 __VERSION__ = (1, 2, 0, 'final', 0)
 
@@ -37,8 +41,11 @@ TASKS_RUNTIME = prometheus_client.Histogram(
     'celery_tasks_runtime_seconds', 'Task runtime (seconds)',
     ['name'],
     buckets=(1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0))
-TASKS_QUEUE_LENGTH = prometheus_client.Gauge(
-    'celery_tasks_in_queue', 'Number of tasks in the broker queues',
+QUEUE_LENGTHS = prometheus_client.Gauge(
+    'celery_queue_lengths', 'the size of the redis broker queues',
+    ['queue'])
+QUEUE_TASKS = prometheus_client.Gauge(
+    'celery_queue_tasks', 'the number of tasks in the redis broker queue',
     ['queue', 'name'])
 
 
@@ -55,29 +62,10 @@ class MonitorThread(threading.Thread):
         self._state = self._app.events.State(max_tasks_in_memory=max_tasks_in_memory)
         self._known_states = set()
         self._known_states_names = set()
-        self._task_queues = dict()
-        self._task_counts_in_queue = dict()
         super(MonitorThread, self).__init__(*args, **kwargs)
 
     def run(self):  # pragma: no cover
         self._monitor()
-
-    def _handle_tasks_sent(self, event, state=None):
-        try:
-            task_name = event['name']
-            task_queue = event.get('queue') or self._task_queues.get(task_name)
-            if not task_queue:
-                return
-
-            self._task_queues.update({task_name: task_queue})
-            self._task_counts_in_queue.setdefault(task_name, 0)
-        except KeyError:
-            pass
-        else:
-            self._task_counts_in_queue[task_name] += 1 if not state else -1
-            cnt = collections.Counter(self._task_counts_in_queue)
-            for t in set(cnt.elements()):
-                TASKS_QUEUE_LENGTH.labels(queue=task_queue, name=task_name).set(cnt[t])
 
     def _process_event(self, evt):
         # Events might come in in parallel. Celery already has a lock
@@ -119,8 +107,6 @@ class MonitorThread(threading.Thread):
                     evt['timestamp'] - prev_evt.timestamp)
 
     def _collect_tasks(self, evt, state):
-        if state in celery.states.RECEIVED:
-            self._handle_tasks_sent(evt, state)
         if state in celery.states.READY_STATES:
             self._incr_ready_task(evt, state)
         else:
@@ -159,14 +145,13 @@ class MonitorThread(threading.Thread):
             try:
                 with self._app.connection() as conn:
                     recv = self._app.events.Receiver(conn, handlers={
-                        'task-sent': self._handle_tasks_sent,
                         '*': self._process_event,
                     })
                     setup_metrics(self._app)
                     recv.capture(limit=None, timeout=None, wakeup=True)
                     self.log.info("Connected to broker")
             except Exception as e:
-                self.log.exception("Queue connection failed")
+                self.log.exception(f"Queue connection failed: {str(e)}")
                 setup_metrics(self._app)
                 time.sleep(5)
 
@@ -211,6 +196,62 @@ class EnableEventsThread(threading.Thread):
 
     def enable_events(self):
         self._app.control.enable_events()
+
+
+class BrokerQueueMonitorThread(threading.Thread):
+    KEY_PREFIX = '_kombu.binding.'
+    BUILTIN_QUEUES = ['celery.pidbox', 'reply.celery.pidbox', 'celeryev']
+    INTERVAL_SECONDS = os.environ.get('QUEUE_INTERVAL_SECONDS', 10)
+
+    def __init__(self, redis_client, *args, **kwargs):
+        self.redis_client = redis_client
+        self.log = logging.getLogger('broker-queues')
+        super().__init__(*args, **kwargs)
+
+    def run(self):
+        while True:
+            try:
+                self.collect_metrics()
+            except Exception as exc:
+                self.log.exception(f'Error while trying to collecting broker queue metrics: {str(exc)}')
+
+            time.sleep(self.INTERVAL_SECONDS)
+
+    def collect_metrics(self):
+        queues = self._get_all_queues()
+        task_queues = self._get_task_queues(queues)
+
+        map(self._collect_queue_lengths, queues)
+        map(self._collect_queue_tasks, task_queues)
+
+    def _get_task_queues(self, queues):
+        return [q for q in queues if q not in self.BUILTIN_QUEUES]
+
+    def _get_all_queues(self):
+        queues = self.redis_client.keys(f'{self.KEY_PREFIX}*')
+        return [q.decode()[len(self.KEY_PREFIX):] for q in queues]
+
+    def _collect_queue_lengths(self, queue):
+        length = self.redis_client.llen(queue)
+        QUEUE_LENGTHS.labels(queue=queue).set(length)
+
+    def _collect_queue_tasks(self, queue):
+        task_counts = dict()
+        tasks = self.redis_client.lrange(queue, 0, -1)
+
+        for t in tasks:
+            try:
+                task_payload = json.loads(t.decode())
+                task_name = task_payload['headers']['task']
+            except (KeyError, JSONDecodeError):
+                pass
+            else:
+                task_counts.setdefault(task_name, 0)
+                task_counts[task_name] += 1
+
+        for k, v in task_counts.items():
+            QUEUE_TASKS.labels(queue=queue, name=k).set(v)
+
 
 def setup_metrics(app):
     """
@@ -297,6 +338,7 @@ def main():  # pragma: no cover
         time.tzset()
 
     app = celery.Celery(broker=opts.broker)
+    redis_client = redis.Redis.from_url(opts.broker)
 
     if opts.transport_options:
         try:
@@ -316,6 +358,9 @@ def main():  # pragma: no cover
     w = WorkerMonitoringThread(app=app)
     w.daemon = True
     w.start()
+    q = BrokerQueueMonitorThread(redis_client=redis_client)
+    q.daemon = True
+    q.start()
     e = None
     if opts.enable_events:
         e = EnableEventsThread(app=app)
@@ -324,6 +369,7 @@ def main():  # pragma: no cover
     start_httpd(opts.addr)
     t.join()
     w.join()
+    q.join()
     if e is not None:
         e.join()
 

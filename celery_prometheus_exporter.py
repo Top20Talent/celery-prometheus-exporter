@@ -115,7 +115,7 @@ class MonitorThread(threading.Thread):
         else:
             # ignore latency if it is a retry
             if prev_evt.state == celery.states.RECEIVED:
-                LATENCY.labels.observe(
+                LATENCY.observe(
                     evt['timestamp'] - prev_evt.timestamp)
 
     def _collect_tasks(self, evt, state):

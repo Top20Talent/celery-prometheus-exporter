@@ -38,7 +38,7 @@ TASKS_RUNTIME = prometheus_client.Histogram(
     ['name'],
     buckets=(1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0))
 TASKS_QUEUE_LENGTH = prometheus_client.Gauge(
-    'celery_tasks_in_queues', 'Number of tasks in the broker queues',
+    'celery_tasks_in_queue', 'Number of tasks in the broker queues',
     ['queue', 'name'])
 
 

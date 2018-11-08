@@ -260,7 +260,7 @@ class BrokerQueueMonitorThread(threading.Thread):
 
         for t in full_tasks:
             if t.decode() not in existing_tasks:
-                QUEUE_TASKS.labels(queue=queue, name=t).set(0)
+                QUEUE_TASKS.labels(queue=queue, name=t.decode()).set(0)
 
         # update the full task list
         self.redis_client.sadd(f'{queue}_tasks', *existing_tasks)

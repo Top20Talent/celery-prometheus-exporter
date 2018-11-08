@@ -263,7 +263,8 @@ class BrokerQueueMonitorThread(threading.Thread):
                 QUEUE_TASKS.labels(queue=queue, name=t.decode()).set(0)
 
         # update the full task list
-        self.redis_client.sadd(f'{queue}_tasks', *existing_tasks)
+        if existing_tasks:
+            self.redis_client.sadd(f'{queue}_tasks', *existing_tasks)
 
 
 def setup_metrics(app):

@@ -41,10 +41,6 @@ TASKS_RUNTIME = prometheus_client.Histogram(
     'celery_tasks_runtime_seconds', 'Task runtime (seconds)',
     ['name'],
     buckets=(1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0))
-TASKS_EXEC_TIME = prometheus_client.Histogram(
-    'celery_tasks_exec_time_seconds', 'Task execution time (seconds)',
-    ['name'],
-    buckets=(1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 180.0, 300.0, 600.0))
 QUEUE_LENGTHS = prometheus_client.Gauge(
     'celery_queue_lengths', 'the size of the redis broker queues',
     ['queue'])
@@ -98,8 +94,6 @@ class MonitorThread(threading.Thread):
             pass
         else:
             TASKS_RUNTIME.labels(name=prev_evt.name).observe(evt['runtime'])
-            TASKS_EXEC_TIME.labels(name=prev_evt.name).observe(
-                evt['timestamp'] - prev_evt.timestamp)
 
     def _observe_latency(self, evt):
         try:
